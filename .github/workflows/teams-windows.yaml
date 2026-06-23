@@ -1,0 +1,114 @@
+name: Build Teams Windows App
+
+env:
+  TEAMS_SAFE_DOMAINS: teams.microsoft.com,login.microsoftonline.com,microsoftonline.com,login.live.com,microsoft.com,office.com,office365.com,sharepoint.com,onedrive.live.com
+
+on:
+  workflow_dispatch:
+    inputs:
+      teams_url:
+        description: Teams web URL
+        required: true
+        default: https://teams.microsoft.com/v2/
+      app_name:
+        description: Windows app name
+        required: true
+        default: Teams
+      width:
+        description: Window width
+        required: true
+        default: "1400"
+      height:
+        description: Window height
+        required: true
+        default: "900"
+      debug:
+        description: Enable debug/devtools build
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build-windows:
+    name: Teams Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node, Rust and Windows packaging tools
+        uses: ./.github/actions/setup-env
+        with:
+          mode: build
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.93.0-x86_64-pc-windows-msvc --component rustfmt --component clippy
+          rustup target add x86_64-pc-windows-msvc --toolchain 1.93.0-x86_64-pc-windows-msvc
+
+      - name: Build Pake CLI
+        run: pnpm run cli:build
+
+      - name: Build Teams app
+        shell: pwsh
+        run: |
+          $args = @(
+            "${{ inputs.teams_url }}",
+            "--name", "${{ inputs.app_name }}",
+            "--width", "${{ inputs.width }}",
+            "--height", "${{ inputs.height }}",
+            "--new-window",
+            "--multi-window",
+            "--safe-domain", "${{ env.TEAMS_SAFE_DOMAINS }}",
+            "--keep-binary",
+            "--targets", "x64"
+          )
+
+          if ("${{ inputs.debug }}" -eq "true") {
+            $args += "--debug"
+          }
+
+          Write-Host "Running: node dist/cli.js $($args -join ' ')"
+          node dist/cli.js $args
+
+          git checkout -- src-tauri/Cargo.lock
+
+      - name: Collect Windows output
+        shell: pwsh
+        run: |
+          $outputDir = "output\windows"
+          New-Item -Path $outputDir -ItemType Directory -Force | Out-Null
+
+          $appName = "${{ inputs.app_name }}"
+          $candidateFiles = @()
+
+          $candidateFiles += Get-ChildItem -Path "." -Filter "$appName.msi" -File -ErrorAction SilentlyContinue
+          $candidateFiles += Get-ChildItem -Path "." -Filter "$appName.exe" -File -ErrorAction SilentlyContinue
+          $candidateFiles += Get-ChildItem -Path "src-tauri\target\x86_64-pc-windows-msvc\release\bundle\msi" -Filter "*.msi" -File -ErrorAction SilentlyContinue
+          $candidateFiles += Get-ChildItem -Path "src-tauri\target\x86_64-pc-windows-msvc\release" -Filter "*.exe" -File -ErrorAction SilentlyContinue
+          $candidateFiles += Get-ChildItem -Path "src-tauri\target\release\bundle\msi" -Filter "*.msi" -File -ErrorAction SilentlyContinue
+          $candidateFiles += Get-ChildItem -Path "src-tauri\target\release" -Filter "*.exe" -File -ErrorAction SilentlyContinue
+
+          $candidateFiles = $candidateFiles | Where-Object { $_ -and $_.Exists } | Sort-Object FullName -Unique
+
+          if (-not $candidateFiles) {
+            Write-Error "No Windows artifacts found."
+            Get-ChildItem -Path "src-tauri\target" -Recurse -Include "*.msi", "*.exe" -ErrorAction SilentlyContinue | Select-Object FullName
+            exit 1
+          }
+
+          foreach ($file in $candidateFiles) {
+            Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $outputDir $file.Name) -Force
+          }
+
+          Get-ChildItem -Path $outputDir -File | Select-Object Name, Length
+
+      - name: Upload Teams Windows artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: Teams-Windows-x64
+          path: output/windows/*
+          retention-days: 7
